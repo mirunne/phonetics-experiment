@@ -1,62 +1,191 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>English Pronunciation Study</title>
-
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 700px;
-            margin: 50px auto;
-            padding: 20px;
-            line-height: 1.6;
-            color: #333;
-            background-color: #f7f7f7;
-        }
-
-        main {
-            background: white;
-            padding: 30px;
-            border-radius: 12px;
-        }
-
-        h1 {
-            color: #243b53;
-        }
-
-        button {
-            padding: 12px 20px;
-            background-color: #243b53;
-            color: white;
-            border: none;
-            border-radius: 6px;
-            font-size: 16px;
-            cursor: pointer;
-        }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>English Pronunciation Study</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 700px;
+      margin: 40px auto;
+      padding: 20px;
+      line-height: 1.6;
+      color: #333;
+      background: #f7f7f7;
+    }
+    main {
+      background: white;
+      padding: 28px;
+      border-radius: 12px;
+    }
+    button {
+      padding: 12px 18px;
+      margin: 6px 4px 6px 0;
+      border: 0;
+      border-radius: 6px;
+      background: #243b53;
+      color: white;
+      font-size: 16px;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    audio {
+      display: block;
+      width: 100%;
+      margin: 16px 0;
+    }
+    #status { font-weight: bold; }
+  </style>
 </head>
-
 <body>
-    <main>
-        <h1>English Pronunciation Study</h1>
+<main>
+  <h1>English Pronunciation Study</h1>
+  <p>This is a preliminary microphone and recording test.</p>
+  <p>Find a quiet room, allow microphone access, and speak
+     normally for about 10 seconds.</p>
 
-        <p>Welcome, and thank you for your interest in this study.</p>
+  <button id="start">Start recording</button>
+  <button id="stop" disabled>Stop recording</button>
 
-        <p>
-            This study explores English pronunciation and attitudes
-            towards different English accents.
-        </p>
+  <p id="status" role="status">Ready to test.</p>
+  <audio id="playback" controls hidden></audio>
+  <p><a id="download" hidden>Download recording (WAV)</a></p>
+</main>
 
-        <p>
-            This is a preliminary test page. The recording tasks and
-            questionnaire will be added later.
-        </p>
+<script>
+const startButton = document.getElementById("start");
+const stopButton = document.getElementById("stop");
+const statusText = document.getElementById("status");
+const playback = document.getElementById("playback");
+const downloadLink = document.getElementById("download");
 
-        <button type="button" onclick="alert('The test page is working!')">
-            Test button
-        </button>
-    </main>
-</body>
+let audioContext;
+let source;
+let processor;
+let stream;
+let chunks = [];
+let recording = false;
+
+startButton.addEventListener("click", async () => {
+  try {
+    startButton.disabled = true;
+    statusText.textContent = "Requesting microphone access…";
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: { ideal: 1 },
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      }
+    });
+
+    audioContext = new AudioContext();
+    await audioContext.resume();
+
+    source = audioContext.createMediaStreamSource(stream);
+    processor = audioContext.createScriptProcessor(4096, 1, 1);
+    chunks = [];
+
+    processor.onaudioprocess = event => {
+      if (!recording) return;
+      chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+    };
+
+    source.connect(processor);
+    processor.connect(audioContext.destination);
+
+    recording = true;
+    stopButton.disabled = false;
+    statusText.textContent =
+      "Recording… Speak normally, then press Stop recording.";
+  } catch (error) {
+    statusText.textContent =
+      "Could not start recording: " + error.message;
+    startButton.disabled = false;
+    if (stream) stream.getTracks().forEach(track => track.stop());
+  }
+});
+
+stopButton.addEventListener("click", async () => {
+  recording = false;
+  stopButton.disabled = true;
+
+  if (processor) processor.disconnect();
+  if (source) source.disconnect();
+  if (stream) stream.getTracks().forEach(track => track.stop());
+
+  const sampleRate = audioContext.sampleRate;
+  const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const samples = new Float32Array(totalLength);
+  let offset = 0;
+
+  for (const chunk of chunks) {
+    samples.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  if (audioContext) await audioContext.close();
+
+  if (samples.length === 0) {
+    statusText.textContent = "No audio was captured. Please try again.";
+    startButton.disabled = false;
+    return;
+  }
+
+  const wav = encodeWav(samples, sampleRate);
+  const url = URL.createObjectURL(wav);
+
+  playback.src = url;
+  playback.hidden = false;
+  downloadLink.href = url;
+  downloadLink.download = "recording-test.wav";
+  downloadLink.hidden = false;
+
+  statusText.textContent =
+    "Recording ready. Play it back and download the WAV to check it.";
+  startButton.disabled = false;
+});
+
+function encodeWav(samples, sampleRate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+
+  function writeString(offset, text) {
+    for (let i = 0; i < text.length; i++) {
+      view.setUint8(offset + i, text.charCodeAt(i));
+    }
+  }
+
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+
+  for (let i = 0; i < samples.length; i++) {
+    const sample = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(
+      44 + i * 2,
+      sample < 0 ? sample * 32768 : sample * 32767,
+      true
+    );
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+</script>
 </html>
