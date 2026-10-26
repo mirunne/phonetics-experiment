@@ -95,6 +95,7 @@ let chunks = [];
 let recording = false;
 function showAudioDiagnostics(track, audioContext) {
   const settings = track.getSettings();
+  const constraints = track.getConstraints();
 
   const diagnostics = document.getElementById("diagnostics");
   diagnostics.hidden = false;
@@ -113,9 +114,17 @@ function showAudioDiagnostics(track, audioContext) {
       ${settings.autoGainControl ?? "Not reported"}</p>
     <p><strong>Microphone label:</strong>
       ${track.label || "Not reported"}</p>
+      <p><strong>Requested channel count:</strong>
+  ${constraints.channelCount?.ideal ?? constraints.channelCount ?? "Not specified"}</p>
+<p><strong>Requested echo cancellation:</strong>
+  ${constraints.echoCancellation ?? "Not specified"}</p>
+<p><strong>Requested noise suppression:</strong>
+  ${constraints.noiseSuppression ?? "Not specified"}</p>
+<p><strong>Requested automatic gain control:</strong>
+  ${constraints.autoGainControl ?? "Not specified"}</p>
   `;
 }
-
+  
 startButton.addEventListener("click", async () => {
   try {
     startButton.disabled = true;
