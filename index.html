@@ -15,11 +15,13 @@
       color: #333;
       background: #f7f7f7;
     }
+
     main {
       background: white;
       padding: 28px;
       border-radius: 12px;
     }
+
     button {
       padding: 12px 18px;
       margin: 6px 4px 6px 0;
@@ -30,105 +32,171 @@
       font-size: 16px;
       cursor: pointer;
     }
+
     button:disabled {
       opacity: 0.5;
       cursor: not-allowed;
     }
+
     audio {
       display: block;
       width: 100%;
       margin: 16px 0;
     }
-    #status { font-weight: bold; }
+
+    #status {
+      font-weight: bold;
+    }
+
+    #diagnostics {
+      background: #f0f4f8;
+      padding: 16px;
+      border-radius: 8px;
+      overflow-wrap: anywhere;
+    }
   </style>
 </head>
+
 <body>
 <main>
   <h1>English Pronunciation Study</h1>
   <p>This is a preliminary microphone and recording test.</p>
-  
-<section id="reading-task">
-  <h2>Practice reading</h2>
+
+  <section id="reading-task">
+    <h2>Practice reading</h2>
+    <p>
+      Please read the following passage aloud at your normal pace.
+      Speak naturally and do not try to imitate a particular accent.
+    </p>
+
+    <div style="background:#f0f4f8; padding:18px; border-radius:8px;">
+      The three students thought about the book they had read.
+      One chose a blue notebook, while another looked at the clock.
+      They walked through the quiet room and discussed their plans.
+    </div>
+
+    <p>
+      When you are ready, press Start recording. Read the passage
+      aloud, then press Stop recording.
+    </p>
+  </section>
+
   <p>
-    Please read the following passage aloud at your normal pace.
-    Speak naturally and do not try to imitate a particular accent.
+    Find a quiet room and allow microphone access when prompted.
+    Read the entire passage before stopping the recording.
   </p>
 
-  <div style="background:#f0f4f8; padding:18px; border-radius:8px;">
-    The three students thought about the book they had read.
-    One chose a blue notebook, while another looked at the clock.
-    They walked through the quiet room and discussed their plans.
-  </div>
+  <button id="start" type="button">Start recording</button>
+  <button id="stop" type="button" disabled>Stop recording</button>
 
-  <p>
-    When you are ready, press Start recording. Read the passage
-    aloud, then press Stop recording.
-  </p>
-</section>
+  <p id="status" role="status" aria-live="polite">Ready to test.</p>
 
-  <p>Find a quiet room and allow microphone access when prompted.
-   Read the entire passage before stopping the recording.</p>
+  <div id="diagnostics" hidden></div>
 
-  <button id="start">Start recording</button>
-  <button id="stop" disabled>Stop recording</button>
-
-  <p id="status" role="status">Ready to test.</p>
-  <div id="diagnostics" hidden
-     style="background:#f0f4f8; padding:16px; border-radius:8px;">
-</div>
   <audio id="playback" controls hidden></audio>
   <p><a id="download" hidden>Download recording (WAV)</a></p>
 </main>
 
 <script>
+"use strict";
+
 const startButton = document.getElementById("start");
 const stopButton = document.getElementById("stop");
 const statusText = document.getElementById("status");
 const playback = document.getElementById("playback");
 const downloadLink = document.getElementById("download");
+const diagnostics = document.getElementById("diagnostics");
 
-let audioContext;
-let source;
-let processor;
-let stream;
+let audioContext = null;
+let stream = null;
+let source = null;
+let workletNode = null;
+let silentGain = null;
 let chunks = [];
 let recording = false;
-function showAudioDiagnostics(track, audioContext) {
+let starting = false;
+let recordingUrl = null;
+
+function showAudioDiagnostics(track, context) {
   const settings = track.getSettings();
   const constraints = track.getConstraints();
 
-  const diagnostics = document.getElementById("diagnostics");
-  diagnostics.hidden = false;
+  const formatValue = value =>
+    value === undefined ? "Not reported" : String(value);
 
+  diagnostics.hidden = false;
   diagnostics.innerHTML = `
     <h2>Microphone diagnostics</h2>
     <p><strong>AudioContext sample rate:</strong>
-      ${audioContext.sampleRate} Hz</p>
+      ${context.sampleRate} Hz</p>
     <p><strong>Reported channel count:</strong>
-      ${settings.channelCount ?? "Not reported"}</p>
+      ${formatValue(settings.channelCount)}</p>
     <p><strong>Echo cancellation:</strong>
-      ${settings.echoCancellation ?? "Not reported"}</p>
+      ${formatValue(settings.echoCancellation)}</p>
     <p><strong>Noise suppression:</strong>
-      ${settings.noiseSuppression ?? "Not reported"}</p>
+      ${formatValue(settings.noiseSuppression)}</p>
     <p><strong>Automatic gain control:</strong>
-      ${settings.autoGainControl ?? "Not reported"}</p>
+      ${formatValue(settings.autoGainControl)}</p>
     <p><strong>Microphone label:</strong>
       ${track.label || "Not reported"}</p>
-      <p><strong>Requested channel count:</strong>
-  ${constraints.channelCount?.ideal ?? constraints.channelCount ?? "Not specified"}</p>
-<p><strong>Requested echo cancellation:</strong>
-  ${constraints.echoCancellation ?? "Not specified"}</p>
-<p><strong>Requested noise suppression:</strong>
-  ${constraints.noiseSuppression ?? "Not specified"}</p>
-<p><strong>Requested automatic gain control:</strong>
-  ${constraints.autoGainControl ?? "Not specified"}</p>
+    <p><strong>Requested channel count:</strong>
+      ${formatValue(constraints.channelCount?.ideal ??
+                    constraints.channelCount)}</p>
+    <p><strong>Requested echo cancellation:</strong>
+      ${formatValue(constraints.echoCancellation)}</p>
+    <p><strong>Requested noise suppression:</strong>
+      ${formatValue(constraints.noiseSuppression)}</p>
+    <p><strong>Requested automatic gain control:</strong>
+      ${formatValue(constraints.autoGainControl)}</p>
   `;
 }
-  
+
+async function cleanUpRecorder() {
+  recording = false;
+
+  if (workletNode) {
+    workletNode.port.onmessage = null;
+    workletNode.disconnect();
+    workletNode = null;
+  }
+
+  if (source) {
+    source.disconnect();
+    source = null;
+  }
+
+  if (silentGain) {
+    silentGain.disconnect();
+    silentGain = null;
+  }
+
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop());
+    stream = null;
+  }
+
+  if (audioContext && audioContext.state !== "closed") {
+    await audioContext.close();
+  }
+
+  audioContext = null;
+}
+
 startButton.addEventListener("click", async () => {
+  if (starting || recording) return;
+
+  starting = true;
+  startButton.disabled = true;
+  stopButton.disabled = true;
+  chunks = [];
+  statusText.textContent = "Requesting microphone access…";
+
   try {
-    startButton.disabled = true;
-    statusText.textContent = "Requesting microphone access…";
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error(
+        "Microphone recording is unavailable in this browser context. Open the HTTPS website in a supported browser."
+      );
+    }
 
     stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -141,42 +209,87 @@ startButton.addEventListener("click", async () => {
 
     audioContext = new AudioContext();
     await audioContext.resume();
-    showAudioDiagnostics(stream.getAudioTracks()[0], audioContext);
+
+    if (!audioContext.audioWorklet) {
+      throw new Error("AudioWorklet is not supported by this browser.");
+    }
+
+    await audioContext.audioWorklet.addModule("recorder-worklet.js");
+
+    const track = stream.getAudioTracks()[0];
+    showAudioDiagnostics(track, audioContext);
 
     source = audioContext.createMediaStreamSource(stream);
-    processor = audioContext.createScriptProcessor(4096, 1, 1);
-    chunks = [];
 
-    processor.onaudioprocess = event => {
-      if (!recording) return;
-      chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+    workletNode = new AudioWorkletNode(
+      audioContext,
+      "recorder-processor",
+      {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1]
+      }
+    );
+
+    silentGain = audioContext.createGain();
+    silentGain.gain.value = 0;
+
+    source.connect(workletNode);
+    workletNode.connect(silentGain);
+    silentGain.connect(audioContext.destination);
+
+    workletNode.port.onmessage = event => {
+      if (recording && event.data instanceof Float32Array) {
+        chunks.push(new Float32Array(event.data));
+      }
     };
 
-    source.connect(processor);
-    processor.connect(audioContext.destination);
-
+    workletNode.port.postMessage("start");
     recording = true;
     stopButton.disabled = false;
     statusText.textContent =
-      "Recording… Speak normally, then press Stop recording.";
+      "Recording… Read the passage, then press Stop recording.";
   } catch (error) {
+    await cleanUpRecorder();
+
     statusText.textContent =
       "Could not start recording: " + error.message;
     startButton.disabled = false;
-    if (stream) stream.getTracks().forEach(track => track.stop());
+    stopButton.disabled = true;
+  } finally {
+    starting = false;
   }
 });
 
 stopButton.addEventListener("click", async () => {
+  if (!recording) return;
+
   recording = false;
   stopButton.disabled = true;
+  statusText.textContent = "Preparing your recording…";
 
-  if (processor) processor.disconnect();
-  if (source) source.disconnect();
-  if (stream) stream.getTracks().forEach(track => track.stop());
+  // Allow any audio messages already queued by the worklet to arrive.
+  await new Promise(resolve => setTimeout(resolve, 100));
 
-  const sampleRate = audioContext.sampleRate;
-  const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  if (workletNode) {
+    workletNode.port.postMessage("stop");
+  }
+
+  const sampleRate = audioContext?.sampleRate;
+
+  await cleanUpRecorder();
+
+  if (!chunks.length || !sampleRate) {
+    statusText.textContent =
+      "No audio was captured. Please try again.";
+    startButton.disabled = false;
+    return;
+  }
+
+  const totalLength = chunks.reduce(
+    (sum, chunk) => sum + chunk.length, 0
+  );
+
   const samples = new Float32Array(totalLength);
   let offset = 0;
 
@@ -185,25 +298,22 @@ stopButton.addEventListener("click", async () => {
     offset += chunk.length;
   }
 
-  if (audioContext) await audioContext.close();
+  const wav = encodeWav(samples, sampleRate);
 
-  if (samples.length === 0) {
-    statusText.textContent = "No audio was captured. Please try again.";
-    startButton.disabled = false;
-    return;
+  if (recordingUrl) {
+    URL.revokeObjectURL(recordingUrl);
   }
 
-  const wav = encodeWav(samples, sampleRate);
-  const url = URL.createObjectURL(wav);
-
-  playback.src = url;
+  recordingUrl = URL.createObjectURL(wav);
+  playback.src = recordingUrl;
   playback.hidden = false;
-  downloadLink.href = url;
+
+  downloadLink.href = recordingUrl;
   downloadLink.download = "recording-test.wav";
   downloadLink.hidden = false;
 
   statusText.textContent =
-    "Recording ready. Play it back and download the WAV to check it.";
+    "Recording ready. Play it back or download the WAV.";
   startButton.disabled = false;
 });
 
@@ -222,8 +332,8 @@ function encodeWav(samples, sampleRate) {
   writeString(8, "WAVE");
   writeString(12, "fmt ");
   view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // Mono
   view.setUint32(24, sampleRate, true);
   view.setUint32(28, sampleRate * 2, true);
   view.setUint16(32, 2, true);
@@ -242,5 +352,10 @@ function encodeWav(samples, sampleRate) {
 
   return new Blob([buffer], { type: "audio/wav" });
 }
+
+window.addEventListener("pagehide", () => {
+  if (recordingUrl) URL.revokeObjectURL(recordingUrl);
+});
 </script>
+</body>
 </html>
