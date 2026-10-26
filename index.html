@@ -73,6 +73,9 @@
   <button id="stop" disabled>Stop recording</button>
 
   <p id="status" role="status">Ready to test.</p>
+  <div id="diagnostics" hidden
+     style="background:#f0f4f8; padding:16px; border-radius:8px;">
+</div>
   <audio id="playback" controls hidden></audio>
   <p><a id="download" hidden>Download recording (WAV)</a></p>
 </main>
@@ -90,6 +93,28 @@ let processor;
 let stream;
 let chunks = [];
 let recording = false;
+function showAudioDiagnostics(track, audioContext) {
+  const settings = track.getSettings();
+
+  const diagnostics = document.getElementById("diagnostics");
+  diagnostics.hidden = false;
+
+  diagnostics.innerHTML = `
+    <h2>Microphone diagnostics</h2>
+    <p><strong>AudioContext sample rate:</strong>
+      ${audioContext.sampleRate} Hz</p>
+    <p><strong>Reported channel count:</strong>
+      ${settings.channelCount ?? "Not reported"}</p>
+    <p><strong>Echo cancellation:</strong>
+      ${settings.echoCancellation ?? "Not reported"}</p>
+    <p><strong>Noise suppression:</strong>
+      ${settings.noiseSuppression ?? "Not reported"}</p>
+    <p><strong>Automatic gain control:</strong>
+      ${settings.autoGainControl ?? "Not reported"}</p>
+    <p><strong>Microphone label:</strong>
+      ${track.label || "Not reported"}</p>
+  `;
+}
 
 startButton.addEventListener("click", async () => {
   try {
@@ -107,6 +132,7 @@ startButton.addEventListener("click", async () => {
 
     audioContext = new AudioContext();
     await audioContext.resume();
+    showAudioDiagnostics(stream.getAudioTracks()[0], audioContext);
 
     source = audioContext.createMediaStreamSource(stream);
     processor = audioContext.createScriptProcessor(4096, 1, 1);
