@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -53,6 +52,12 @@
       padding: 16px;
       border-radius: 8px;
       overflow-wrap: anywhere;
+      margin-top: 18px;
+    }
+
+    #diagnostics .warning {
+      color: #8a3b12;
+      font-weight: bold;
     }
   </style>
 </head>
@@ -94,11 +99,14 @@
   <div id="diagnostics" hidden></div>
 
   <audio id="playback" controls hidden></audio>
-  <p><a id="download" hidden>Download recording (WAV)</a></p>
+  <p><a id="download" hidden>Download recording (24-bit WAV)</a></p>
 </main>
 
 <script>
 "use strict";
+
+const TARGET_SAMPLE_RATE = 48000;
+const STOP_ACK_TIMEOUT_MS = 3000;
 
 const startButton = document.getElementById("start");
 const stopButton = document.getElementById("stop");
@@ -116,57 +124,154 @@ let chunks = [];
 let recording = false;
 let starting = false;
 let recordingUrl = null;
+let stopAcknowledged = null;
+let stopTimeout = null;
 
-function showAudioDiagnostics(track, context) {
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function formatValue(value) {
+  if (value === undefined || value === null) {
+    return "Not reported";
+  }
+
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+
+  return String(value);
+}
+
+function showAudioDiagnostics(track, context, contextNote = "") {
   const settings = track.getSettings();
   const constraints = track.getConstraints();
+  const contextRateMatches = context.sampleRate === TARGET_SAMPLE_RATE;
 
-  const formatValue = value =>
-    value === undefined ? "Not reported" : String(value);
+  const contextRateMessage = contextRateMatches
+    ? "Yes"
+    : `No. The browser is using ${context.sampleRate} Hz; this WAV will be labelled with that actual rate.`;
 
   diagnostics.hidden = false;
   diagnostics.innerHTML = `
-    <h2>Microphone diagnostics</h2>
-    <p><strong>AudioContext sample rate:</strong>
-      ${context.sampleRate} Hz</p>
-    <p><strong>Reported channel count:</strong>
-      ${formatValue(settings.channelCount)}</p>
+    <h2>Audio diagnostics</h2>
+
+    <p><strong>WAV export format:</strong>
+      Mono, signed 24-bit PCM</p>
+
+    <p><strong>AudioContext / WAV sample rate:</strong>
+      ${escapeHtml(context.sampleRate)} Hz</p>
+
+    <p><strong>48 kHz target active:</strong>
+      ${escapeHtml(contextRateMessage)}</p>
+
+    <p><strong>Microphone-reported sample rate:</strong>
+      ${escapeHtml(formatValue(settings.sampleRate))}</p>
+
+    <p><strong>Microphone-reported sample size:</strong>
+      ${escapeHtml(formatValue(settings.sampleSize))}</p>
+
+    <p><strong>Reported input channel count:</strong>
+      ${escapeHtml(formatValue(settings.channelCount))}</p>
+
     <p><strong>Echo cancellation:</strong>
-      ${formatValue(settings.echoCancellation)}</p>
+      ${escapeHtml(formatValue(settings.echoCancellation))}</p>
+
     <p><strong>Noise suppression:</strong>
-      ${formatValue(settings.noiseSuppression)}</p>
+      ${escapeHtml(formatValue(settings.noiseSuppression))}</p>
+
     <p><strong>Automatic gain control:</strong>
-      ${formatValue(settings.autoGainControl)}</p>
+      ${escapeHtml(formatValue(settings.autoGainControl))}</p>
+
     <p><strong>Microphone label:</strong>
-      ${track.label || "Not reported"}</p>
+      ${escapeHtml(track.label || "Not reported")}</p>
+
+    <p><strong>Requested sample rate:</strong>
+      ${escapeHtml(formatValue(constraints.sampleRate))}</p>
+
+    <p><strong>Requested sample size:</strong>
+      ${escapeHtml(formatValue(constraints.sampleSize))}</p>
+
     <p><strong>Requested channel count:</strong>
-      ${formatValue(constraints.channelCount?.ideal ??
-                    constraints.channelCount)}</p>
+      ${escapeHtml(formatValue(constraints.channelCount))}</p>
+
     <p><strong>Requested echo cancellation:</strong>
-      ${formatValue(constraints.echoCancellation)}</p>
+      ${escapeHtml(formatValue(constraints.echoCancellation))}</p>
+
     <p><strong>Requested noise suppression:</strong>
-      ${formatValue(constraints.noiseSuppression)}</p>
+      ${escapeHtml(formatValue(constraints.noiseSuppression))}</p>
+
     <p><strong>Requested automatic gain control:</strong>
-      ${formatValue(constraints.autoGainControl)}</p>
+      ${escapeHtml(formatValue(constraints.autoGainControl))}</p>
+
+    ${contextNote
+      ? `<p class="warning">${escapeHtml(contextNote)}</p>`
+      : ""}
+
+    ${contextRateMatches
+      ? ""
+      : `<p class="warning">
+          The requested 48 kHz AudioContext rate was not obtained on
+          this device/browser. Check this before using the recording
+          in the study.
+        </p>`}
   `;
 }
 
 async function cleanUpRecorder() {
   recording = false;
 
+  if (stopTimeout !== null) {
+    clearTimeout(stopTimeout);
+    stopTimeout = null;
+  }
+
+  stopAcknowledged = null;
+
   if (workletNode) {
     workletNode.port.onmessage = null;
-    workletNode.disconnect();
+
+    try {
+      workletNode.port.close();
+    } catch {
+      // The port may already be closed.
+    }
+
+    try {
+      workletNode.disconnect();
+    } catch {
+      // The node may already be disconnected.
+    }
+
     workletNode = null;
   }
 
   if (source) {
-    source.disconnect();
+    try {
+      source.disconnect();
+    } catch {
+      // The node may already be disconnected.
+    }
+
     source = null;
   }
 
   if (silentGain) {
-    silentGain.disconnect();
+    try {
+      silentGain.disconnect();
+    } catch {
+      // The node may already be disconnected.
+    }
+
     silentGain = null;
   }
 
@@ -176,7 +281,11 @@ async function cleanUpRecorder() {
   }
 
   if (audioContext && audioContext.state !== "closed") {
-    await audioContext.close();
+    try {
+      await audioContext.close();
+    } catch {
+      // Continue cleanup if the browser fails to close the context.
+    }
   }
 
   audioContext = null;
@@ -189,6 +298,11 @@ startButton.addEventListener("click", async () => {
   startButton.disabled = true;
   stopButton.disabled = true;
   chunks = [];
+
+  playback.hidden = true;
+  downloadLink.hidden = true;
+  diagnostics.hidden = true;
+
   statusText.textContent = "Requesting microphone access…";
 
   try {
@@ -201,13 +315,34 @@ startButton.addEventListener("click", async () => {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: { ideal: 1 },
+        sampleRate: { ideal: TARGET_SAMPLE_RATE },
+        sampleSize: { ideal: 24 },
         echoCancellation: false,
         noiseSuppression: false,
         autoGainControl: false
       }
     });
 
-    audioContext = new AudioContext();
+    const AudioContextClass =
+      window.AudioContext || window.webkitAudioContext;
+
+    if (!AudioContextClass) {
+      throw new Error("Web Audio is not supported by this browser.");
+    }
+
+    let contextNote = "";
+
+    try {
+      audioContext = new AudioContextClass({
+        sampleRate: TARGET_SAMPLE_RATE
+      });
+    } catch (error) {
+      contextNote =
+        `The browser could not create a 48 kHz AudioContext and its default rate was used. (${error.message})`;
+
+      audioContext = new AudioContextClass();
+    }
+
     await audioContext.resume();
 
     if (!audioContext.audioWorklet) {
@@ -217,7 +352,12 @@ startButton.addEventListener("click", async () => {
     await audioContext.audioWorklet.addModule("recorder-worklet.js");
 
     const track = stream.getAudioTracks()[0];
-    showAudioDiagnostics(track, audioContext);
+
+    if (!track) {
+      throw new Error("No audio input track was found.");
+    }
+
+    showAudioDiagnostics(track, audioContext, contextNote);
 
     source = audioContext.createMediaStreamSource(stream);
 
@@ -239,86 +379,141 @@ startButton.addEventListener("click", async () => {
     silentGain.connect(audioContext.destination);
 
     workletNode.port.onmessage = event => {
-      if (recording && event.data instanceof Float32Array) {
+      if (event.data instanceof Float32Array) {
+        // Accept chunks posted immediately before the stop acknowledgement.
         chunks.push(new Float32Array(event.data));
+        return;
+      }
+
+      if (
+        event.data &&
+        event.data.type === "stopped" &&
+        stopAcknowledged
+      ) {
+        const resolveStop = stopAcknowledged;
+        stopAcknowledged = null;
+
+        if (stopTimeout !== null) {
+          clearTimeout(stopTimeout);
+          stopTimeout = null;
+        }
+
+        resolveStop();
       }
     };
 
     workletNode.port.postMessage("start");
+
     recording = true;
     stopButton.disabled = false;
-    statusText.textContent =
-      "Recording… Read the passage, then press Stop recording.";
+
+    if (audioContext.sampleRate === TARGET_SAMPLE_RATE) {
+      statusText.textContent =
+        "Recording… Read the passage, then press Stop recording.";
+    } else {
+      statusText.textContent =
+        `Recording at ${audioContext.sampleRate} Hz, not the target 48,000 Hz. Check the diagnostics before using this file.`;
+    }
   } catch (error) {
     await cleanUpRecorder();
 
     statusText.textContent =
       "Could not start recording: " + error.message;
-    startButton.disabled = false;
-    stopButton.disabled = true;
   } finally {
     starting = false;
+    startButton.disabled = recording;
   }
 });
 
 stopButton.addEventListener("click", async () => {
-  if (!recording) return;
+  if (!recording || !workletNode || !audioContext) return;
+
+  const currentWorklet = workletNode;
+  const sampleRate = audioContext.sampleRate;
 
   recording = false;
   stopButton.disabled = true;
-  statusText.textContent = "Preparing your recording…";
+  startButton.disabled = true;
 
-  // Allow any audio messages already queued by the worklet to arrive.
-  await new Promise(resolve => setTimeout(resolve, 100));
+  statusText.textContent = "Finishing recording…";
 
-  if (workletNode) {
-    workletNode.port.postMessage("stop");
-  }
+  try {
+    await new Promise((resolve, reject) => {
+      stopAcknowledged = resolve;
 
-  const sampleRate = audioContext?.sampleRate;
+      stopTimeout = setTimeout(() => {
+        stopAcknowledged = null;
+        stopTimeout = null;
 
-  await cleanUpRecorder();
+        reject(new Error(
+          "The recorder did not confirm stopping. No file was saved; please try again."
+        ));
+      }, STOP_ACK_TIMEOUT_MS);
 
-  if (!chunks.length || !sampleRate) {
+      currentWorklet.port.postMessage("stop");
+    });
+
+    // The worklet's earlier audio messages are handled before its acknowledgement.
+    const totalLength = chunks.reduce(
+      (sum, chunk) => sum + chunk.length,
+      0
+    );
+
+    if (totalLength === 0) {
+      throw new Error("No audio was captured. Please try again.");
+    }
+
+    const samples = new Float32Array(totalLength);
+    let offset = 0;
+
+    for (const chunk of chunks) {
+      samples.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    await cleanUpRecorder();
+
+    const wav = encodeWav24BitMono(samples, sampleRate);
+
+    if (recordingUrl) {
+      URL.revokeObjectURL(recordingUrl);
+    }
+
+    recordingUrl = URL.createObjectURL(wav);
+
+    playback.src = recordingUrl;
+    playback.hidden = false;
+
+    downloadLink.href = recordingUrl;
+    downloadLink.download = "recording-test-24bit.wav";
+    downloadLink.textContent = "Download recording (24-bit WAV)";
+    downloadLink.hidden = false;
+
     statusText.textContent =
-      "No audio was captured. Please try again.";
+      `Recording ready: mono, 24-bit PCM WAV, ${sampleRate} Hz.`;
+  } catch (error) {
+    await cleanUpRecorder();
+
+    statusText.textContent =
+      "Could not prepare recording: " + error.message;
+  } finally {
+    recording = false;
     startButton.disabled = false;
-    return;
+    stopButton.disabled = true;
   }
-
-  const totalLength = chunks.reduce(
-    (sum, chunk) => sum + chunk.length, 0
-  );
-
-  const samples = new Float32Array(totalLength);
-  let offset = 0;
-
-  for (const chunk of chunks) {
-    samples.set(chunk, offset);
-    offset += chunk.length;
-  }
-
-  const wav = encodeWav(samples, sampleRate);
-
-  if (recordingUrl) {
-    URL.revokeObjectURL(recordingUrl);
-  }
-
-  recordingUrl = URL.createObjectURL(wav);
-  playback.src = recordingUrl;
-  playback.hidden = false;
-
-  downloadLink.href = recordingUrl;
-  downloadLink.download = "recording-test.wav";
-  downloadLink.hidden = false;
-
-  statusText.textContent =
-    "Recording ready. Play it back or download the WAV.";
-  startButton.disabled = false;
 });
 
-function encodeWav(samples, sampleRate) {
-  const buffer = new ArrayBuffer(44 + samples.length * 2);
+function encodeWav24BitMono(samples, sampleRate) {
+  const bytesPerSample = 3;
+  const dataSize = samples.length * bytesPerSample;
+  const padding = dataSize % 2;
+
+  // A standard RIFF WAV file has a 32-bit chunk-size field.
+  if (dataSize > 0xFFFFFFFF - 36 - padding) {
+    throw new Error("The recording is too large for a standard WAV file.");
+  }
+
+  const buffer = new ArrayBuffer(44 + dataSize + padding);
   const view = new DataView(buffer);
 
   function writeString(offset, text) {
@@ -328,33 +523,55 @@ function encodeWav(samples, sampleRate) {
   }
 
   writeString(0, "RIFF");
-  view.setUint32(4, 36 + samples.length * 2, true);
+  view.setUint32(4, 36 + dataSize + padding, true);
   writeString(8, "WAVE");
   writeString(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true); // PCM
-  view.setUint16(22, 1, true); // Mono
+  view.setUint32(16, 16, true);   // PCM format chunk size
+  view.setUint16(20, 1, true);    // Linear PCM
+  view.setUint16(22, 1, true);    // Mono
   view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true);
-  view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true);
+  view.setUint32(28, sampleRate * bytesPerSample, true);
+  view.setUint16(32, bytesPerSample, true); // Block alignment
+  view.setUint16(34, 24, true);             // Bits per sample
   writeString(36, "data");
-  view.setUint32(40, samples.length * 2, true);
+  view.setUint32(40, dataSize, true);
 
   for (let i = 0; i < samples.length; i++) {
-    const sample = Math.max(-1, Math.min(1, samples[i]));
-    view.setInt16(
-      44 + i * 2,
-      sample < 0 ? sample * 32768 : sample * 32767,
-      true
+    const rawSample = Number.isFinite(samples[i]) ? samples[i] : 0;
+    const sample = Math.max(-1, Math.min(1, rawSample));
+
+    const signedValue = Math.round(
+      sample < 0 ? sample * 8388608 : sample * 8388607
     );
+
+    // Convert signed PCM to its 24-bit two's-complement representation.
+    const value24 = signedValue < 0
+      ? signedValue + 16777216
+      : signedValue;
+
+    const byteOffset = 44 + i * bytesPerSample;
+
+    // 24-bit PCM is stored least-significant byte first.
+    view.setUint8(byteOffset, value24 & 0xFF);
+    view.setUint8(byteOffset + 1, (value24 >>> 8) & 0xFF);
+    view.setUint8(byteOffset + 2, (value24 >>> 16) & 0xFF);
   }
 
   return new Blob([buffer], { type: "audio/wav" });
 }
 
 window.addEventListener("pagehide", () => {
-  if (recordingUrl) URL.revokeObjectURL(recordingUrl);
+  if (recordingUrl) {
+    URL.revokeObjectURL(recordingUrl);
+  }
+
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop());
+  }
+
+  if (audioContext && audioContext.state !== "closed") {
+    audioContext.close().catch(() => {});
+  }
 });
 </script>
 </body>
