@@ -120,6 +120,7 @@ let starting = false;
 let recordingUrl = null;
 let stopAcknowledged = null;
 let stopTimeout = null;
+let workletStats = null;
 
 function escapeHtml(value) {
   return String(value)
@@ -285,6 +286,89 @@ async function cleanUpRecorder() {
   audioContext = null;
 }
 
+function toDbfs(amplitude) {
+  if (!Number.isFinite(amplitude) || amplitude <= 0) return "−∞ dBFS";
+  return `${(20 * Math.log10(amplitude)).toFixed(1)} dBFS`;
+}
+
+function measureFloatLevels(samples) {
+  let peak = 0;
+  let sumSquares = 0;
+
+  for (let i = 0; i < samples.length; i++) {
+    const value = Number.isFinite(samples[i]) ? samples[i] : 0;
+    const absolute = Math.abs(value);
+    if (absolute > peak) peak = absolute;
+    sumSquares += value * value;
+  }
+
+  const rms = samples.length ? Math.sqrt(sumSquares / samples.length) : 0;
+  return { sampleCount: samples.length, peak, rms, peakDbfs: toDbfs(peak), rmsDbfs: toDbfs(rms) };
+}
+
+async function measureWav24BitLevels(blob) {
+  const buffer = await blob.arrayBuffer();
+  const view = new DataView(buffer);
+  const dataSize = view.getUint32(40, true);
+  const sampleCount = Math.floor(dataSize / 3);
+  let peak = 0;
+  let sumSquares = 0;
+
+  for (let i = 0; i < sampleCount; i++) {
+    const offset = 44 + i * 3;
+    const unsigned = view.getUint8(offset)
+      | (view.getUint8(offset + 1) << 8)
+      | (view.getUint8(offset + 2) << 16);
+    const signed = (unsigned & 0x800000) ? unsigned - 0x1000000 : unsigned;
+    const value = signed < 0 ? signed / 8388608 : signed / 8388607;
+    const absolute = Math.abs(value);
+    if (absolute > peak) peak = absolute;
+    sumSquares += value * value;
+  }
+
+  const rms = sampleCount ? Math.sqrt(sumSquares / sampleCount) : 0;
+  return { sampleCount, peak, rms, peakDbfs: toDbfs(peak), rmsDbfs: toDbfs(rms) };
+}
+
+function displaySignalDiagnostics(inputStats, rawLevels, wavLevels) {
+  const channelRows = inputStats?.channels?.length
+    ? inputStats.channels.map(channel => `
+        <tr>
+          <td>Input channel ${channel.channel}</td>
+          <td>${channel.frames.toLocaleString()}</td>
+          <td>${toDbfs(channel.peak)}</td>
+          <td>${toDbfs(channel.rms)}</td>
+        </tr>`).join("")
+    : `<tr><td colspan="4">Input-channel statistics were not received from the worklet.</td></tr>`;
+
+  const mixedRow = inputStats?.mixed ? `
+      <tr>
+        <td>Mono mix sent to page</td>
+        <td>${inputStats.mixed.frames.toLocaleString()}</td>
+        <td>${toDbfs(inputStats.mixed.peak)}</td>
+        <td>${toDbfs(inputStats.mixed.rms)}</td>
+      </tr>` : "";
+
+  diagnostics.insertAdjacentHTML("beforeend", `
+    <hr>
+    <h3>Signal-level diagnostics (no gain applied)</h3>
+    <p><strong>Worklet input channel count:</strong> ${inputStats?.channelCount ?? "Not reported"}</p>
+    <p>Peak and RMS are shown in dBFS. Values closer to 0 dBFS are louder; 0 dBFS is the digital maximum.</p>
+    <div style="overflow-x:auto">
+      <table style="width:100%;border-collapse:collapse">
+        <thead><tr><th style="text-align:left">Signal</th><th style="text-align:left">Frames</th><th style="text-align:left">Peak</th><th style="text-align:left">RMS</th></tr></thead>
+        <tbody>
+          ${channelRows}
+          ${mixedRow}
+          <tr><td>Float samples before WAV encoding</td><td>${rawLevels.sampleCount.toLocaleString()}</td><td>${rawLevels.peakDbfs}</td><td>${rawLevels.rmsDbfs}</td></tr>
+          <tr><td>Decoded 24-bit WAV</td><td>${wavLevels.sampleCount.toLocaleString()}</td><td>${wavLevels.peakDbfs}</td><td>${wavLevels.rmsDbfs}</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>How to interpret:</strong> compare each input channel's RMS with the mono mix. If the mix is much quieter than a channel (for example, several dB lower), the downmix may be reducing the signal. The float-sample and decoded-WAV levels should be nearly identical; a meaningful difference would point to a conversion/encoding issue.</p>
+  `);
+}
+
 startButton.addEventListener("click", async () => {
   if (starting || recording) return;
 
@@ -292,6 +376,7 @@ startButton.addEventListener("click", async () => {
   startButton.disabled = true;
   stopButton.disabled = true;
   chunks = [];
+  workletStats = null;
 
   playback.hidden = true;
   downloadLink.hidden = true;
@@ -384,6 +469,7 @@ startButton.addEventListener("click", async () => {
         event.data.type === "stopped" &&
         stopAcknowledged
       ) {
+        workletStats = event.data.stats || null;
         const resolveStop = stopAcknowledged;
         stopAcknowledged = null;
 
@@ -468,6 +554,9 @@ stopButton.addEventListener("click", async () => {
     await cleanUpRecorder();
 
     const wav = encodeWav24BitMono(samples, sampleRate);
+    const rawLevels = measureFloatLevels(samples);
+    const wavLevels = await measureWav24BitLevels(wav);
+    displaySignalDiagnostics(workletStats, rawLevels, wavLevels);
 
     if (recordingUrl) {
       URL.revokeObjectURL(recordingUrl);
