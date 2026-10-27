@@ -428,7 +428,7 @@ startButton.addEventListener("click", async () => {
       throw new Error("AudioWorklet is not supported by this browser.");
     }
 
-    await audioContext.audioWorklet.addModule("recorder-worklet.js");
+    await audioContext.audioWorklet.addModule("recorder-worklet.js?v=channel-stats-2");
 
     const track = stream.getAudioTracks()[0];
 
